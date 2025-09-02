@@ -13,6 +13,8 @@ import matscipy.neighbours
 import numpy as np
 import yaml
 from tqdm import tqdm
+import json as _json
+import os
 
 
 def preprocess_graph(
@@ -21,7 +23,25 @@ def preprocess_graph(
     cutoff: float,
     targets: bool,
 ) -> dict:
-    src, dst, shift = matscipy.neighbours.neighbour_list("ijS", atoms, cutoff)
+    """Convert ASE Atoms to a dict backing a jraph.GraphsTuple.
+
+    - Uses matscipy neighbour list for periodic cells; falls back to ASE for molecules.
+    - Targets (energy/forces/stress) are optional and filled safely downstream.
+    """
+    # Robust periodic detection; matscipy requires invertible cell
+    cell = atoms.cell.array if hasattr(atoms.cell, "array") else np.asarray(atoms.cell)
+    det = 0.0
+    try:
+        det = float(np.linalg.det(cell))
+    except Exception:
+        det = 0.0
+
+    if atoms.pbc.any() and abs(det) > 1e-12:
+        src, dst, shift = matscipy.neighbours.neighbour_list("ijS", atoms, cutoff)
+    else:
+        src, dst = ase.neighborlist.neighbor_list("ij", atoms, cutoff)
+        shift = np.zeros((len(src), 3), dtype=np.float32)
+
     graph_dict = {
         "n_node": np.array([len(atoms)]).astype(np.int32),
         "n_edge": np.array([len(src)]).astype(np.int32),
@@ -32,33 +52,74 @@ def preprocess_graph(
         "shifts": shift.astype(np.float32),
         "cell": atoms.cell.astype(np.float32),
     }
+
     if targets:
-        graph_dict["forces"] = atoms.get_forces().astype(np.float32)
-        graph_dict["energy"] = np.array([atoms.get_potential_energy()]).astype(np.float32)
+        # Energy may be provided by calculator or atoms.info['energy'] (e.g., MSR-ACC JSON)
+        energy = None
+        try:
+            energy = atoms.get_potential_energy()
+        except Exception:
+            energy = atoms.info.get("energy")
+        if energy is not None:
+            graph_dict["energy"] = np.array([float(energy)], dtype=np.float32)
+
+        # Forces/stress might not exist for energy-only datasets
+        try:
+            graph_dict["forces"] = atoms.get_forces().astype(np.float32)
+        except Exception:
+            pass
         try:
             graph_dict["stress"] = atoms.get_stress(voigt=False).astype(np.float32)
-        except ase.calculators.calculator.PropertyNotImplementedError:
+        except Exception:
             pass
+
+    # Propagate molecular charge if available (defaults to 0 for neutral)
+    try:
+        ch = atoms.info.get("charge", 0.0)
+    except Exception:
+        ch = 0.0
+    graph_dict["charge"] = np.array([float(ch)], dtype=np.float32)
 
     return graph_dict
 
 
 def dict_to_graphstuple(graph_dict: dict) -> jraph.GraphsTuple:
+    """Create GraphsTuple with safe defaults for missing targets.
+
+    - forces: zeros [N,3] if absent
+    - energy: [NaN] if absent (training typically requires energies present)
+    - stress: zeros [3,3] if absent
+    """
+    n_nodes = graph_dict["positions"].shape[0]
+    forces = graph_dict.get("forces")
+    if forces is None:
+        forces = np.zeros((n_nodes, 3), dtype=np.float32)
+    energy = graph_dict.get("energy")
+    if energy is None:
+        energy = np.array([np.nan], dtype=np.float32)
+    stress = graph_dict.get("stress")
+    if stress is None:
+        stress = np.zeros((3, 3), dtype=np.float32)
+    charge = graph_dict.get("charge")
+    if charge is None:
+        charge = np.array([0.0], dtype=np.float32)
+
     return jraph.GraphsTuple(
         n_node=graph_dict["n_node"],
         n_edge=graph_dict["n_edge"],
         nodes={
             "species": graph_dict["species"],
             "positions": graph_dict["positions"],
-            "forces": graph_dict["forces"] if "forces" in graph_dict else None,
+            "forces": forces,
         },
         edges={"shifts": graph_dict["shifts"]},
         senders=graph_dict["senders"],
         receivers=graph_dict["receivers"],
         globals={
             "cell": graph_dict["cell"][None, ...],
-            "energy": graph_dict["energy"] if "energy" in graph_dict else None,
-            "stress": graph_dict["stress"][None, ...] if "stress" in graph_dict else None,
+            "energy": energy,
+            "stress": stress[None, ...],
+            "charge": charge,
         },
     )
 
@@ -75,10 +136,16 @@ def preprocess_file(
     return [preprocess_graph(atoms, atomic_indices, cutoff, True) for atoms in data]
 
 
-def save_graphs_to_hdf5(graphs, output_path, progress_bar=True):
-    """Save graphs to HDF5 file"""
+def save_graphs_to_hdf5(graphs, output_path, progress_bar=True, attrs: dict | None = None):
+    """Save graphs to HDF5 file with optional file-level attributes."""
     with h5py.File(output_path, "w") as f:
         f.attrs["n_graphs"] = len(graphs)
+        if attrs:
+            for k, v in attrs.items():
+                try:
+                    f.attrs[k] = v
+                except Exception:
+                    pass
         for i, graph_dict in enumerate(
             tqdm(graphs, desc="saving graphs", disable=not progress_bar)
         ):
@@ -86,21 +153,90 @@ def save_graphs_to_hdf5(graphs, output_path, progress_bar=True):
             for key, value in graph_dict.items():
                 grp.create_dataset(key, data=value)
 
+def _atoms_from_msracc_json(path: Path) -> ase.Atoms:
+    """Create ASE Atoms from an MSR-ACC JSON file.
+
+    - Reads atomic numbers and geometry
+    - Selects an atomization energy (TAE, Hartree) and converts to eV in atoms.info['energy'].
+      Stored convention: energy = +TAE[eV] (positive binding/atomization energy).
+    """
+    with open(path, "r") as f:
+        data = _json.load(f)
+    if "atomic_numbers" in data:
+        Z = np.array(data["atomic_numbers"], dtype=np.int32)
+    else:
+        # Some variants store element symbols
+        from ase.data import chemical_symbols
+
+        Z = np.array([chemical_symbols.index(s) for s in data["elements"]], dtype=np.int32)
+    geom = np.array(data.get("geometry"), dtype=np.float32).reshape(-1, 3)
+    atoms = ase.Atoms(numbers=Z, positions=geom, pbc=False)
+
+    # Energy selection for MSR-ACC
+    # Priority:
+    # 1) If NEQUIX_MSRACC_ENERGY_MODE is set to 'ccsd_all' or 'ccsd_val', compute from W1-F12 components
+    # 2) Else, if W1-F12 components exist, default to 'ccsd_all' (HF + delta-CCSD + delta-CV)
+    # 3) Else fall back to explicit single-key energies, with optional NEQUIX_MSRACC_ENERGY_KEY override
+    extras = data.get("extras", {})
+    energy_h = None
+
+    def has(key):
+        return (key in extras) and (extras[key] is not None)
+
+    # 0) Explicit single-key override takes precedence if provided
+    override_key = os.environ.get("NEQUIX_MSRACC_ENERGY_KEY")
+    if override_key and has(override_key):
+        energy_h = float(extras[override_key])
+
+    mode = os.environ.get("NEQUIX_MSRACC_ENERGY_MODE", "").strip().lower()
+    if energy_h is None and (mode in {"ccsd_all", "ccsd_val"} or (has("tae[HF]@w1-f12") and has("tae[delta-CCSD]@w1-f12"))):
+        # Build CCSD valence; add core-valence if required/available
+        if has("tae[HF]@w1-f12") and has("tae[delta-CCSD]@w1-f12"):
+            energy_h = float(extras["tae[HF]@w1-f12"]) + float(extras["tae[delta-CCSD]@w1-f12"])
+            use_cv = (mode == "ccsd_all") or (mode == "" and has("tae[delta-CV]@w1-f12"))
+            if use_cv and has("tae[delta-CV]@w1-f12"):
+                energy_h += float(extras["tae[delta-CV]@w1-f12"])
+        # If components missing, fall through to single-key strategy
+
+    if energy_h is None:
+        candidates = [
+            "tae@ccsd(t)/6-31g*",
+            "tae@w1-f12",
+        ]
+        for k in candidates:
+            if k and k in extras and extras[k] is not None:
+                energy_h = float(extras[k])
+                break
+    if energy_h is not None:
+        # MSR-ACC stores atomization energies (TAE) in Hartree. Use positive binding energy in eV.
+        # Convention: atoms.info['energy'] = +TAE[eV]
+        atoms.info["energy"] = energy_h * 27.211386245988  # Hartree → eV, positive
+    # Also carry molecular charge if present
+    if "molecular_charge" in data:
+        try:
+            atoms.info["charge"] = float(data["molecular_charge"])  # usually 0.0
+        except Exception:
+            atoms.info["charge"] = 0.0
+    return atoms
+
 
 def process_worker_files(args):
-    """Process files for one worker"""
+    """Process a chunk of files (.extxyz or .json) for one worker."""
     worker_id, file_paths, output_path, atomic_indices, cutoff = args
     all_graphs = []
-    for file_path in tqdm(
-        file_paths,
-        desc="reading graphs",
-        disable=worker_id != 0,
-    ):
-        data = ase.io.read(file_path, index=":", format="extxyz")
-        graphs = [preprocess_graph(atoms, atomic_indices, cutoff, True) for atoms in data]
-        all_graphs.extend(graphs)
-
-    save_graphs_to_hdf5(all_graphs, output_path, progress_bar=worker_id == 0)
+    for file_path in tqdm(file_paths, desc="reading graphs", disable=worker_id != 0):
+        fp = Path(file_path)
+        if fp.suffix == ".extxyz":
+            data = ase.io.read(fp, index=":", format="extxyz")
+            graphs = [preprocess_graph(atoms, atomic_indices, cutoff, True) for atoms in data]
+            all_graphs.extend(graphs)
+        elif fp.suffix == ".json":
+            atoms = _atoms_from_msracc_json(fp)
+            graphs = [preprocess_graph(atoms, atomic_indices, cutoff, True)]
+            all_graphs.extend(graphs)
+    # Annotate energy type when saving JSON (TAE in eV) for downstream checks
+    attrs = {"energy_type": "tae_eV"} if (len(file_paths) > 0 and str(file_paths[0]).endswith('.json')) else None
+    save_graphs_to_hdf5(all_graphs, output_path, progress_bar=worker_id == 0, attrs=attrs)
     return len(all_graphs)
 
 
@@ -157,8 +293,15 @@ class Dataset:
 
     def _create_cache(self, file_path, cache_dir, cutoff):
         if file_path.is_dir():
+            # Prefer EXTXYZ; if none, use JSON (MSR-ACC)
             file_paths = sorted(file_path.glob("*.extxyz"))
-            n_workers = 16
+            if not file_paths:
+                file_paths = sorted(file_path.glob("*.json"))
+            # Number of workers: bounded by CPU and number of files
+            import os as _os
+            cpu = max(1, int((_os.cpu_count() or 8)))
+            env_w = int(_os.environ.get("NEQUIX_PREPROCESS_WORKERS", "0") or 0)
+            n_workers = env_w if env_w > 0 else min(8, cpu, max(1, len(file_paths)))
             chunk_size = len(file_paths) // n_workers + 1
             tasks = []
             for worker_id in range(n_workers):
@@ -177,10 +320,15 @@ class Dataset:
                         )
                     )
 
-            with multiprocessing.Pool(n_workers) as p:
-                list(tqdm(p.imap(process_worker_files, tasks), total=len(tasks)))
-
+            if tasks:
+                # Use spawn context to avoid forking a multithreaded JAX process
+                ctx = multiprocessing.get_context("spawn")
+                # Use small maxtasksperchild to bound memory; unordered to avoid head-of-line blocking
+                with ctx.Pool(n_workers, maxtasksperchild=8) as p:
+                    for _ in tqdm(p.imap_unordered(process_worker_files, tasks), total=len(tasks)):
+                        pass
         else:
+            # Single file; assume EXTXYZ
             data = ase.io.read(file_path, index=":", format="extxyz")
             graphs = [
                 preprocess_graph(atoms, self.atomic_indices, cutoff, True) for atoms in tqdm(data)
@@ -199,15 +347,20 @@ class Dataset:
         return dict_to_graphstuple(graph_dict)
 
     def __del__(self):
-        if hasattr(self, "_file_handles"):
-            for fh in self._file_handles:
-                fh.close()
+        fhs = getattr(self, "_file_handles", None)
+        if fhs:
+            for fh in fhs:
+                try:
+                    fh.close()
+                except Exception:
+                    pass
 
 
 def _dataloader_worker(dataset, index_queue, output_queue):
     while True:
         try:
-            index = index_queue.get(timeout=0)
+            # Block briefly to avoid busy-spin; exit cleanly on sentinel
+            index = index_queue.get(timeout=1.0)
         except queue.Empty:
             continue
         if index is None:
@@ -230,6 +383,7 @@ class DataLoader:
         seed=0,
         shuffle=False,
         buffer_factor=1.1,
+        graphs_buffer_factor=2.0,
         num_workers=4,
         prefetch_factor=2,
     ):
@@ -243,7 +397,8 @@ class DataLoader:
         self._generator = None  # created in __iter__
         self.n_node = max(batch_size * avg_n_nodes * buffer_factor, max_n_nodes) + 1
         self.n_edge = max(batch_size * avg_n_edges * buffer_factor, max_n_edges)
-        self.n_graph = batch_size + 1
+        # Allow packing more small graphs if budgets permit
+        self.n_graph = max(batch_size + 1, int(batch_size * graphs_buffer_factor))
         self.num_workers = num_workers
         self.prefetch_factor = prefetch_factor
 
@@ -257,15 +412,14 @@ class DataLoader:
         if self._started:
             return
 
-        # NB: we can use fork here, only because we are not using jax
-        # in the workers (data is just numpy arrays)
-        # multiprocessing.set_start_method("spawn", force=True)
+        # Use a spawn context to avoid os.fork from a multithreaded JAX process
         self._started = True
-        self.index_queue = multiprocessing.Queue()
-        self.output_queue = multiprocessing.Queue()
+        ctx = multiprocessing.get_context("spawn")
+        self.index_queue = ctx.Queue()
+        self.output_queue = ctx.Queue()
 
         for _ in range(self.num_workers):
-            worker = multiprocessing.Process(
+            worker = ctx.Process(
                 target=_dataloader_worker,
                 args=(self.dataset, self.index_queue, self.output_queue),
             )
@@ -408,28 +562,43 @@ def average_atom_energies(dataset: Dataset) -> list[float]:
 
 def dataset_stats(dataset: Dataset, atom_energies: list[float]) -> dict:
     """Compute the statistics of the dataset."""
-    energies, forces, n_neighbors, n_nodes, n_edges = [], [], [], [], []
+    energies, forces_list, n_neighbors, n_nodes, n_edges = [], [], [], [], []
     atom_energies = np.array(atom_energies)
+    # Track species coverage to detect elements not present in the dataset
+    n_species = atom_energies.shape[0]
+    species_counts = np.zeros((n_species,), dtype=np.int64)
     for graph in tqdm(dataset, total=len(dataset)):
         graph_e0 = np.sum(atom_energies[graph.nodes["species"]])
-        energies.append((graph.globals["energy"][0] - graph_e0) / graph.n_node)
-        forces.append(graph.nodes["forces"])
-        n_neighbors.append(graph.n_edge / graph.n_node)
-        n_nodes.append(graph.n_node)
-        n_edges.append(graph.n_edge)
-    mean = np.mean(np.concatenate(energies, axis=0))
-    rms = np.sqrt(np.mean(np.concatenate(forces, axis=0) ** 2))
-    n_neighbors = np.mean(np.concatenate(n_neighbors, axis=0))
+        # graph.n_node is [1]; get scalar
+        nn = int(np.array(graph.n_node).reshape(-1)[0])
+        ne = int(np.array(graph.n_edge).reshape(-1)[0])
+        # species coverage
+        sc = np.bincount(graph.nodes["species"], minlength=n_species)
+        species_counts += sc
+        energies.append((graph.globals["energy"][0] - graph_e0) / nn)
+        f = graph.nodes.get("forces", None)
+        if not isinstance(f, np.ndarray) or f.ndim != 2 or (f.shape[1] if f.ndim>=2 else 0) != 3:
+            f = np.zeros((nn, 3), dtype=np.float32)
+        forces_list.append(f)
+        n_neighbors.append(ne / max(nn, 1))
+        n_nodes.append(nn)
+        n_edges.append(ne)
+    mean = float(np.mean(np.array(energies, dtype=np.float32))) if energies else 0.0
+    rms = float(np.sqrt(np.mean(np.concatenate(forces_list, axis=0) ** 2))) if forces_list else 0.0
+    # For energy-only datasets, forces are zeros → rms≈0. Clamp to 1.0 to avoid degenerate scale.
+    if float(abs(rms)) < 1e-8:
+        rms = 1.0
+    n_neighbors = float(np.mean(np.array(n_neighbors, dtype=np.float32))) if n_neighbors else 0.0
     stats = {
-        "shift": mean.item(),
-        "scale": rms.item(),
-        "avg_n_neighbors": n_neighbors.item(),
-        "avg_n_nodes": np.mean(n_nodes).item(),
-        "avg_n_edges": np.mean(n_edges).item(),
-        "max_n_nodes": np.max(n_nodes).item(),
-        "max_n_edges": np.max(n_edges).item(),
+        "shift": float(mean),
+        "scale": float(rms),
+        "avg_n_neighbors": float(n_neighbors),
+        "avg_n_nodes": float(np.mean(n_nodes)) if n_nodes else 0.0,
+        "avg_n_edges": float(np.mean(n_edges)) if n_edges else 0.0,
+        "max_n_nodes": int(np.max(n_nodes)) if n_nodes else 0,
+        "max_n_edges": int(np.max(n_edges)) if n_edges else 0,
+        "species_counts": species_counts.tolist(),
     }
     print("computed dataset statistics, add to config yml file to avoid recomputing:")
     print(yaml.dump(stats))
     return stats
-
